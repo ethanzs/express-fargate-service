@@ -1,0 +1,46 @@
+# Copy to terraform.tfvars and fill in. azure_*, vpc_id, the subnet lists, and
+# image_tag are required.
+
+project_name = "express-fargate"
+environment  = "dev"
+region       = "us-east-1"
+
+# Existing network to deploy into.
+vpc_id             = "vpc-0123456789abcdef0"
+public_subnet_ids  = ["subnet-aaaa1111", "subnet-bbbb2222"]
+private_subnet_ids = ["subnet-cccc3333", "subnet-dddd4444"]
+
+# Entra ID (from the API's App Registration). These are identifiers, not secrets.
+azure_tenant_id   = "00000000-0000-0000-0000-000000000000"
+azure_client_id   = "11111111-1111-1111-1111-111111111111"
+azure_ad_audience = "api://11111111-1111-1111-1111-111111111111"
+
+# Browser origins for the SPA (CORS).
+cors_origins = ["https://app.example.com"]
+
+# Immutable image tag to deploy (push this exact tag to ECR first). No "latest".
+image_tag = "git-1a2b3c4"
+
+# Sizing
+cpu                      = 256
+memory                   = 512
+desired_count            = 2
+autoscaling_min_capacity = 2
+autoscaling_max_capacity = 6
+
+# Autoscaling targets — primary is requests/task/min (calibrate from a load
+# test); CPU and memory are guardrails. Cooldowns bias to fast-out/slow-in.
+# autoscaling_request_count_target = 1000
+# autoscaling_cpu_target           = 70
+# autoscaling_memory_target        = 70
+# autoscaling_scale_out_cooldown   = 60
+# autoscaling_scale_in_cooldown    = 300
+
+# TLS: set an ACM cert ARN to serve HTTPS (and redirect HTTP→HTTPS).
+# certificate_arn = "arn:aws:acm:us-east-1:123456789012:certificate/abc-123"
+
+# Optional: SNS topic for CloudWatch alarm notifications.
+# alarm_sns_topic_arn = "arn:aws:sns:us-east-1:123456789012:ops-alerts"
+
+# Prod hardening
+# enable_deletion_protection = true
