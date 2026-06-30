@@ -134,6 +134,9 @@ curl localhost:3000/api/items
 curl -X POST localhost:3000/api/items -H 'content-type: application/json' -d '{"name":"hello"}'
 ```
 
+Full endpoint reference: [`docs/api.md`](docs/api.md) (generated from the routes
+and zod schemas by the `/api-docs` skill).
+
 ## Scripts
 
 | Command              | Purpose                                  |

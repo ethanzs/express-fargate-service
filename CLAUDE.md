@@ -81,7 +81,12 @@ changes, run `terraform fmt` and `terraform validate` in `infrastructure/`.
 - **Docs stay in sync.** Treat docs as part of the change, not an afterthought:
   whenever code changes behavior, update `README.md`, this `CLAUDE.md`, and
   `.env.example` in the same change. A change isn't done until the docs match the
-  code.
+  code. The `/sync-docs` skill (`.claude/skills/sync-docs/`) runs a full
+  audit-and-fix pass across all docs on demand.
+- **API reference is generated.** `docs/api.md` is produced from the routes + zod
+  schemas by the `/api-docs` skill (`.claude/skills/api-docs/`) — don't hand-edit
+  it; re-run `/api-docs` after changing routes or schemas. It's Backstage
+  TechDocs-ready.
 
 ## Auth (Entra ID / MSAL)
 

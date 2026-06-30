@@ -33,7 +33,10 @@ are implemented; update this file as work lands (see the docs-in-sync rule in
 ## Tier 3 — API contract & polish
 
 - [ ] **RFC 9457 Problem Details** error shape (`application/problem+json`).
-- [ ] **OpenAPI spec** — generated from zod schemas; API contract + docs.
+- [x] **API reference (markdown)** — `docs/api.md`, generated from the routes +
+  zod schemas by the `/api-docs` skill. Backstage TechDocs-ready.
+- [ ] **OpenAPI spec** — generated from zod schemas; feeds Backstage's API
+  catalog entity (the markdown reference above is the human/TechDocs view).
 - [ ] **API versioning** (`/api/v1`).
 - [ ] **Pre-commit hooks** (husky + lint-staged) and **coverage thresholds**.
 
