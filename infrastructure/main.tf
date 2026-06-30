@@ -5,7 +5,7 @@
 # https://registry.terraform.io/modules/terraform-aws-modules/ecr/aws
 module "ecr" {
   source  = "terraform-aws-modules/ecr/aws"
-  version = "~> 2.0"
+  version = "~> 3.0"
 
   repository_name = local.name
 
@@ -40,7 +40,7 @@ module "ecr" {
 # https://registry.terraform.io/modules/terraform-aws-modules/alb/aws
 module "alb" {
   source  = "terraform-aws-modules/alb/aws"
-  version = "~> 9.0"
+  version = "~> 10.0"
 
   name    = local.name
   vpc_id  = var.vpc_id
@@ -138,21 +138,21 @@ module "alb" {
 # https://registry.terraform.io/modules/terraform-aws-modules/ecs/aws
 module "ecs" {
   source  = "terraform-aws-modules/ecs/aws"
-  version = "~> 5.0"
+  version = "~> 7.0"
 
   cluster_name = local.name
 
   # Container Insights for cluster-level observability.
-  cluster_settings = [{
+  cluster_setting = [{
     name  = "containerInsights"
     value = "enabled"
   }]
 
-  # Fargate-only capacity. FARGATE_SPOT is available for non-critical workloads.
-  fargate_capacity_providers = {
-    FARGATE = {
-      default_capacity_provider_strategy = { weight = 100 }
-    }
+  # Associate the built-in Fargate capacity providers; default to FARGATE.
+  # (FARGATE_SPOT is available for non-critical workloads.)
+  cluster_capacity_providers = ["FARGATE", "FARGATE_SPOT"]
+  default_capacity_provider_strategy = {
+    FARGATE = { weight = 100 }
   }
 
   services = {
@@ -265,20 +265,18 @@ module "ecs" {
       subnet_ids = var.private_subnet_ids
 
       # Allow inbound only from the ALB; allow all egress (ECR pull, JWKS, logs).
-      security_group_rules = {
-        alb_ingress = {
-          type                     = "ingress"
-          from_port                = var.container_port
-          to_port                  = var.container_port
-          protocol                 = "tcp"
-          source_security_group_id = module.alb.security_group_id
+      security_group_ingress_rules = {
+        alb = {
+          from_port                    = var.container_port
+          to_port                      = var.container_port
+          ip_protocol                  = "tcp"
+          referenced_security_group_id = module.alb.security_group_id
         }
-        egress_all = {
-          type        = "egress"
-          from_port   = 0
-          to_port     = 0
-          protocol    = "-1"
-          cidr_blocks = ["0.0.0.0/0"]
+      }
+      security_group_egress_rules = {
+        all = {
+          ip_protocol = "-1"
+          cidr_ipv4   = "0.0.0.0/0"
         }
       }
 
