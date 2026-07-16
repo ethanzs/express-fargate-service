@@ -1,0 +1,107 @@
+# CI + release.
+#
+# PRs:  gate (typecheck / lint / test) + commitlint on the PR's commits.
+# main: gate, then semantic-release — computes the next version from
+#       Conventional Commits, tags vX.Y.Z, publishes GitHub release notes, and
+#       builds+pushes both service images (code/scripts/release-images.sh).
+#
+# Image publishing needs three repository settings (Settings → Secrets and
+# variables → Actions → Variables):
+#   AWS_RELEASE_ROLE_ARN    IAM role assumed via OIDC (ECR push on both repos)
+#   AWS_REGION              e.g. us-east-1
+#   API_ECR_REPOSITORY      e.g. express-fargate-dev
+#   HYDRATOR_ECR_REPOSITORY e.g. express-fargate-dev-hydrator
+# Until AWS_RELEASE_ROLE_ARN is set, releases still tag + publish notes and
+# just skip the images.
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: code
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: code/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm run format:check
+      - run: npm test
+
+  commitlint:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: code/package-lock.json
+      - run: npm ci
+        working-directory: code
+      - run: >
+          code/node_modules/.bin/commitlint
+          --config code/commitlint.config.mjs
+          --from ${{ github.event.pull_request.base.sha }}
+          --to ${{ github.event.pull_request.head.sha }}
+          --verbose
+
+  release:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: gate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # push the version tag + create the GitHub release
+      id-token: write # OIDC federation to AWS (no long-lived keys)
+    defaults:
+      run:
+        working-directory: code
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # semantic-release needs full history + tags
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: code/package-lock.json
+      - run: npm ci
+
+      - name: Configure AWS credentials (OIDC)
+        if: vars.AWS_RELEASE_ROLE_ARN != ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_RELEASE_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Log in to ECR
+        if: vars.AWS_RELEASE_ROLE_ARN != ''
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Release
+        run: npx semantic-release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Empty when the AWS steps were skipped → images are skipped too.
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+          API_ECR_REPOSITORY: ${{ vars.API_ECR_REPOSITORY }}
+          HYDRATOR_ECR_REPOSITORY: ${{ vars.HYDRATOR_ECR_REPOSITORY }}

@@ -19,7 +19,8 @@ azure_ad_audience = "api://11111111-1111-1111-1111-111111111111"
 cors_origins = ["https://app.example.com"]
 
 # Immutable image tag to deploy (push this exact tag to ECR first). No "latest".
-image_tag = "git-1a2b3c4"
+# Releases push vX.Y.Z tags automatically (see the root README).
+image_tag = "v1.4.0"
 
 # Sizing
 cpu                      = 256
@@ -35,6 +36,32 @@ autoscaling_max_capacity = 6
 # autoscaling_memory_target        = 70
 # autoscaling_scale_out_cooldown   = 60
 # autoscaling_scale_in_cooldown    = 300
+
+# --- Data stores (RDS Postgres + ElastiCache Valkey; hydrator writes, api reads) ---
+# Both are created by this stack. Auth is IAM (run the one-time db_bootstrap
+# task after the first apply). Both are multi-AZ by default — flip the two
+# HA settings to false/1 to shrink a throwaway dev stack.
+# db_engine_version         = "18.4"            # major tracks code/compose.yaml
+# db_instance_class         = "db.t4g.micro"
+# db_allocated_storage      = 20
+# db_max_allocated_storage  = 100
+# db_multi_az               = false             # dev cost-saver (default true)
+# valkey_engine_version     = "9.1"
+# valkey_node_type          = "cache.t4g.micro"
+# valkey_num_cache_clusters = 1                 # dev cost-saver (default 2 = multi-AZ failover)
+
+# --- Hydrator (scheduled one-shot task) ---
+# Immutable image tag for the hydrator (push this exact tag to its ECR repo).
+# Lockstep releases: usually the same version as image_tag.
+hydrator_image_tag = "v1.4.0"
+
+# When to hydrate — cron() or rate(). Default: daily at 06:00 UTC.
+# hydrator_schedule_expression = "cron(0 6 * * ? *)"
+# Pause runs without destroying anything:
+# hydrator_schedule_enabled = false
+# Sizing per run:
+# hydrator_cpu    = 256
+# hydrator_memory = 512
 
 # TLS: set an ACM cert ARN to serve HTTPS (and redirect HTTP→HTTPS).
 # certificate_arn = "arn:aws:acm:us-east-1:123456789012:certificate/abc-123"

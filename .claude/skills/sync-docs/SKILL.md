@@ -1,6 +1,6 @@
 ---
 name: sync-docs
-description: Audit and update this repo's documentation so it matches the current state of the code and Terraform. Use when finishing a change, before a release, or whenever the docs may have drifted. Covers README.md, CLAUDE.md, ROADMAP.md, code/.env.example, and infrastructure/README.md.
+description: Audit and update this repo's documentation so it matches the current state of the code and Terraform. Use when finishing a change, before a release, or whenever the docs may have drifted. Covers README.md, CLAUDE.md, ROADMAP.md, code/api/.env.example and code/hydrator/.env.example, and infrastructure/README.md.
 ---
 
 # Sync docs to code
@@ -12,11 +12,16 @@ same pass, then verify nothing broke.
 
 ## Scope — the docs to keep in sync
 
-- `README.md` — features ("What's inside"), repo/project layout, scripts, env
-  vars, endpoints, deploy flow
+- `README.md` (root) — overview, repo layout, local dev, workspace scripts,
+  Docker/deploy pointers. Generic only — low-level detail belongs in the
+  project READMEs.
+- `code/api/README.md` / `code/hydrator/README.md` / `code/shared/README.md` —
+  per-project detail: endpoints/auth/validation/data access (api), run
+  lifecycle/migrations/metrics (hydrator), exports/consumption rules (shared)
 - `CLAUDE.md` — architecture, conventions, commands, gotchas, repo layout
 - `ROADMAP.md` — checkbox state vs what's actually implemented
-- `code/.env.example` — every env var the app reads
+- `code/api/.env.example` / `code/hydrator/.env.example` — every env var each
+  service reads
 - `infrastructure/README.md` — variables, resources, file layout, autoscaling
 
 ## Step 1 — find what changed
@@ -34,17 +39,22 @@ the latest change. If git is unavailable, read the source files directly.
 
 ## Step 2 — checks (source of truth → doc)
 
-1. **Env vars** — every `process.env.*` read in `code/src/config.ts` (and
-   anywhere else) is present in `code/.env.example` and any README/CLAUDE env
-   tables, with no stale entries. Defaults documented should match the code.
-2. **Routes/endpoints** — routers mounted in `code/src/app.ts` and the files in
-   `code/src/routes/` match the endpoints described in `README.md` (paths, auth
+1. **Env vars** — every `process.env.*` read in `code/api/src/config.ts` and
+   `code/hydrator/src/config.ts` (and anywhere else) is present in that
+   service's `.env.example` and any README/CLAUDE env tables, with no stale
+   entries. Defaults documented should match the code.
+2. **Routes/endpoints** — routers mounted in `code/api/src/app.ts` and the files in
+   `code/api/src/routes/` match the endpoints described in `README.md` (paths, auth
    requirements, public vs protected).
-3. **Scripts** — `code/package.json` `scripts` match the README "Scripts" table.
-4. **Dependencies / features** — notable deps in `code/package.json` are
-   reflected in the README "What's inside" list (and removed deps aren't).
+3. **Scripts** — the workspace scripts in `code/package.json` match the README
+   "Scripts" table (per-service scripts live in `code/*/package.json`).
+4. **Dependencies / features** — notable deps in `code/api/package.json`,
+   `code/hydrator/package.json`, and `code/shared/package.json` are reflected in
+   the README "What's inside" list (and removed deps aren't).
 5. **Middleware order & conventions** — the middleware pipeline and conventions
-   in `CLAUDE.md` match `code/src/app.ts` and the middleware files.
+   in `CLAUDE.md` match `code/api/src/app.ts` and the middleware files; the
+   hydrator run flow in `CLAUDE.md` matches `code/hydrator/src/main.ts`; the
+   `@app/shared` exports described match `code/shared/src/index.ts`.
 6. **Terraform** — variables in `infrastructure/variables.tf`, resources/modules
    in `infrastructure/main.tf` + `infrastructure/data.tf`, and the file list
    match `infrastructure/README.md` (incl. the Layout table and Autoscaling
@@ -61,7 +71,7 @@ rewrite sections that are already correct.
 ## Step 4 — verify
 
 ```bash
-# from code/
+# from code/ (the workspace root — covers shared, api, and hydrator)
 cd code && npm run typecheck && npm run lint && npm test
 
 # from infrastructure/ (if any infra docs/files were touched)

@@ -33,6 +33,32 @@ module "ecr" {
   tags = local.tags
 }
 
+# Separate repo for the hydrator image; same policies as the app repo.
+module "hydrator_ecr" {
+  source  = "terraform-aws-modules/ecr/aws"
+  version = "~> 3.0"
+
+  repository_name = local.hydrator_name
+
+  repository_image_scan_on_push   = true
+  repository_image_tag_mutability = "IMMUTABLE"
+
+  repository_lifecycle_policy = jsonencode({
+    rules = [{
+      rulePriority = 1
+      description  = "Keep last 10 images"
+      selection = {
+        tagStatus   = "any"
+        countType   = "imageCountMoreThan"
+        countNumber = 10
+      }
+      action = { type = "expire" }
+    }]
+  })
+
+  tags = local.tags
+}
+
 # ==============================================================================
 # Load Balancer (ALB)
 # ==============================================================================
@@ -234,6 +260,14 @@ module "ecs" {
             { name = "AZURE_TENANT_ID", value = var.azure_tenant_id },
             { name = "AZURE_CLIENT_ID", value = var.azure_client_id },
             { name = "AZURE_AD_AUDIENCE", value = var.azure_ad_audience },
+            { name = "VALKEY_URL", value = local.valkey_url },
+            # IAM database auth: no password anywhere — the app mints
+            # short-lived tokens as the `api` DB user via its task role.
+            { name = "DB_AUTH", value = "iam" },
+            { name = "DB_HOST", value = module.db.db_instance_address },
+            { name = "DB_PORT", value = tostring(module.db.db_instance_port) },
+            { name = "DB_NAME", value = local.db_name },
+            { name = "DB_USER", value = local.db_service_users.api },
           ]
 
           # Module creates the CloudWatch log group and awslogs config.
@@ -253,6 +287,15 @@ module "ecs" {
           }
         }
       }
+
+      # The task role may mint IAM auth tokens for the `api` DB user only.
+      tasks_iam_role_statements = [
+        {
+          sid       = "RdsIamConnect"
+          actions   = ["rds-db:connect"]
+          resources = ["${local.rds_connect_arn_prefix}/${local.db_service_users.api}"]
+        }
+      ]
 
       load_balancer = {
         app = {
@@ -282,9 +325,290 @@ module "ecs" {
 
       tags = local.tags
     }
+
+    # The hydrator is a run-to-completion job, not a service: create_service =
+    # false makes the module produce only the task definition + IAM roles +
+    # security group + log group. EventBridge Scheduler (below) launches one
+    # task per schedule; it exits when hydration finishes, so nothing runs (or
+    # bills) between runs.
+    hydrator = {
+      create_service = false
+
+      cpu    = var.hydrator_cpu
+      memory = var.hydrator_memory
+
+      container_definitions = {
+        (local.hydrator_container_name) = {
+          essential = true
+          image     = "${module.hydrator_ecr.repository_url}:${var.hydrator_image_tag}"
+
+          # No ports — the hydrator serves nothing.
+          readonly_root_filesystem = true
+
+          environment = [
+            { name = "NODE_ENV", value = lower(var.environment) },
+            { name = "LOG_LEVEL", value = var.log_level },
+            { name = "SERVICE_NAME", value = local.hydrator_name },
+            { name = "VALKEY_URL", value = local.valkey_url },
+            # IAM database auth: short-lived tokens as the `hydrator` DB user.
+            { name = "DB_AUTH", value = "iam" },
+            { name = "DB_HOST", value = module.db.db_instance_address },
+            { name = "DB_PORT", value = tostring(module.db.db_instance_port) },
+            { name = "DB_NAME", value = local.db_name },
+            { name = "DB_USER", value = local.db_service_users.hydrator },
+          ]
+
+          create_cloudwatch_log_group            = true
+          cloudwatch_log_group_retention_in_days = var.log_retention_days
+        }
+      }
+
+      # The task role may mint IAM auth tokens for the `hydrator` DB user only.
+      tasks_iam_role_statements = [
+        {
+          sid       = "RdsIamConnect"
+          actions   = ["rds-db:connect"]
+          resources = ["${local.rds_connect_arn_prefix}/${local.db_service_users.hydrator}"]
+        }
+      ]
+
+      subnet_ids = var.private_subnet_ids
+
+      # No ingress — nothing calls the hydrator. Egress for ECR/logs and to
+      # reach RDS/Valkey (their SGs admit this task SG).
+      security_group_egress_rules = {
+        all = {
+          ip_protocol = "-1"
+          cidr_ipv4   = "0.0.0.0/0"
+        }
+      }
+
+      tags = local.tags
+    }
+
   }
 
   tags = local.tags
+}
+
+# ==============================================================================
+# Data stores (RDS Postgres + ElastiCache Valkey)
+# ==============================================================================
+
+# Postgres is the system of record, Valkey the cache in front of it. The
+# hydrator writes both on its schedule; the api reads cache-first. Both stores
+# admit only the two task security groups — nothing else in the VPC.
+
+resource "aws_security_group" "db" {
+  name_prefix = "${local.name}-postgres-"
+  description = "RDS Postgres - ingress only from the api and hydrator tasks"
+  vpc_id      = var.vpc_id
+
+  tags = local.tags
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+resource "aws_vpc_security_group_ingress_rule" "db" {
+  for_each = local.datastore_clients
+
+  security_group_id            = aws_security_group.db.id
+  description                  = "Postgres from the ${each.key} tasks"
+  from_port                    = 5432
+  to_port                      = 5432
+  ip_protocol                  = "tcp"
+  referenced_security_group_id = each.value
+
+  tags = local.tags
+}
+
+resource "aws_security_group" "valkey" {
+  name_prefix = "${local.name}-valkey-"
+  description = "ElastiCache Valkey - ingress only from the api and hydrator tasks"
+  vpc_id      = var.vpc_id
+
+  tags = local.tags
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+resource "aws_vpc_security_group_ingress_rule" "valkey" {
+  for_each = local.datastore_clients
+
+  security_group_id            = aws_security_group.valkey.id
+  description                  = "Valkey from the ${each.key} tasks"
+  from_port                    = 6379
+  to_port                      = 6379
+  ip_protocol                  = "tcp"
+  referenced_security_group_id = each.value
+
+  tags = local.tags
+}
+
+# https://registry.terraform.io/modules/terraform-aws-modules/rds/aws
+module "db" {
+  source  = "terraform-aws-modules/rds/aws"
+  version = "~> 7.0"
+
+  identifier = "${local.name}-postgres"
+
+  engine         = "postgres"
+  engine_version = var.db_engine_version
+  family         = local.db_parameter_group_family
+  instance_class = var.db_instance_class
+
+  allocated_storage     = var.db_allocated_storage
+  max_allocated_storage = var.db_max_allocated_storage
+  storage_encrypted     = true
+
+  db_name  = local.db_name
+  username = local.db_username
+  # Services authenticate with IAM (short-lived tokens via their task roles),
+  # so no credential is distributed anywhere. The master password exists only
+  # for the one-time db_bootstrap task and is generated, stored, and rotatable
+  # by RDS itself in Secrets Manager.
+  manage_master_user_password         = true
+  iam_database_authentication_enabled = true
+
+  multi_az               = var.db_multi_az
+  create_db_subnet_group = true
+  subnet_ids             = var.private_subnet_ids
+  vpc_security_group_ids = [aws_security_group.db.id]
+
+  auto_minor_version_upgrade = true
+  backup_retention_period    = 7
+  deletion_protection        = var.enable_deletion_protection
+  skip_final_snapshot        = !var.enable_deletion_protection
+
+  tags = local.tags
+}
+
+# https://registry.terraform.io/modules/terraform-aws-modules/elasticache/aws
+module "valkey" {
+  source  = "terraform-aws-modules/elasticache/aws"
+  version = "~> 1.11"
+
+  replication_group_id = "${local.name}-valkey"
+  description          = "Valkey cache for ${local.name} (hydrator writes, api reads)"
+
+  engine         = "valkey"
+  engine_version = var.valkey_engine_version
+  node_type      = var.valkey_node_type
+
+  # Single shard; >1 node turns on automatic failover across AZs.
+  num_cache_clusters         = var.valkey_num_cache_clusters
+  automatic_failover_enabled = var.valkey_num_cache_clusters > 1
+  multi_az_enabled           = var.valkey_num_cache_clusters > 1
+
+  # TLS in transit — the services connect with rediss:// (see local.valkey_url).
+  transit_encryption_enabled = true
+  at_rest_encryption_enabled = true
+
+  create_parameter_group = true
+  parameter_group_family = local.valkey_parameter_group_family
+
+  subnet_group_name = "${local.name}-valkey"
+  subnet_ids        = var.private_subnet_ids
+
+  create_security_group = false
+  security_group_ids    = [aws_security_group.valkey.id]
+
+  tags = local.tags
+}
+
+# ==============================================================================
+# Hydrator schedule (EventBridge Scheduler → ecs:RunTask)
+# ==============================================================================
+
+# Role EventBridge Scheduler assumes to launch the task.
+resource "aws_iam_role" "hydrator_scheduler" {
+  name = "${local.hydrator_name}-scheduler"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "scheduler.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+    }]
+  })
+
+  tags = local.tags
+}
+
+resource "aws_iam_role_policy" "hydrator_scheduler" {
+  name = "run-hydrator-task"
+  role = aws_iam_role.hydrator_scheduler.id
+
+  # RunTask is pinned to the current task-definition revision; Terraform updates
+  # the policy and the schedule together on each deploy.
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = "ecs:RunTask"
+        Resource = module.ecs.services["hydrator"].task_definition_arn
+        Condition = {
+          ArnEquals = { "ecs:cluster" = module.ecs.cluster_arn }
+        }
+      },
+      {
+        Effect = "Allow"
+        Action = "iam:PassRole"
+        Resource = [
+          module.ecs.services["hydrator"].task_exec_iam_role_arn,
+          module.ecs.services["hydrator"].tasks_iam_role_arn,
+        ]
+        Condition = {
+          StringEquals = { "iam:PassedToService" = "ecs-tasks.amazonaws.com" }
+        }
+      },
+    ]
+  })
+}
+
+resource "aws_scheduler_schedule" "hydrator" {
+  name        = local.hydrator_name
+  description = "Launches one hydrator task; it exits when hydration completes."
+  state       = var.hydrator_schedule_enabled ? "ENABLED" : "DISABLED"
+
+  schedule_expression = var.hydrator_schedule_expression
+
+  # Fire at the exact scheduled time (no jitter window) — keeps runs predictable
+  # and lines up with the failure alarm's evaluation period.
+  flexible_time_window {
+    mode = "OFF"
+  }
+
+  target {
+    arn      = module.ecs.cluster_arn
+    role_arn = aws_iam_role.hydrator_scheduler.arn
+
+    ecs_parameters {
+      task_definition_arn = module.ecs.services["hydrator"].task_definition_arn
+      launch_type         = "FARGATE"
+      task_count          = 1
+
+      network_configuration {
+        subnets          = var.private_subnet_ids
+        security_groups  = [module.ecs.services["hydrator"].security_group_id]
+        assign_public_ip = false
+      }
+    }
+
+    # Retries cover launch failures (the RunTask call) only. If the app itself
+    # fails it exits 1 and waits for the next scheduled run — writes are
+    # idempotent, so the schedule is the retry.
+    retry_policy {
+      maximum_retry_attempts       = 2
+      maximum_event_age_in_seconds = 3600
+    }
+  }
 }
 
 # ==============================================================================
@@ -310,6 +634,31 @@ resource "aws_cloudwatch_metric_alarm" "alb_5xx" {
   dimensions = {
     LoadBalancer = module.alb.arn_suffix
     TargetGroup  = module.alb.target_groups["app"].arn_suffix
+  }
+
+  alarm_actions = local.alarm_actions
+  ok_actions    = local.alarm_actions
+  tags          = local.tags
+}
+
+# A hydration run reported failure (the app's per-run EMF metric). Missing data
+# is not breaching — the metric only exists when a run happens; a schedule that
+# never fires won't alarm here (watch the schedule/logs for that).
+resource "aws_cloudwatch_metric_alarm" "hydrator_failures" {
+  alarm_name          = "${local.hydrator_name}-run-failed"
+  alarm_description   = "The most recent hydration run failed (exit 1 / HydrationFailureCount > 0)."
+  namespace           = "HydratorService"
+  metric_name         = "HydrationFailureCount"
+  statistic           = "Sum"
+  period              = 86400 # one evaluation bucket per day — matches the daily schedule
+  evaluation_periods  = 1
+  threshold           = 0
+  comparison_operator = "GreaterThanThreshold"
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    service = local.hydrator_name
+    env     = lower(var.environment)
   }
 
   alarm_actions = local.alarm_actions

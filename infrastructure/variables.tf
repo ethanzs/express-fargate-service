@@ -189,6 +189,97 @@ variable "azure_ad_audience" {
 }
 
 # ---------------------------------------------------------------------------
+# Hydrator (scheduled one-shot task)
+# ---------------------------------------------------------------------------
+
+variable "hydrator_image_tag" {
+  description = "Immutable image tag for the hydrator (e.g. the git SHA). No 'latest'."
+  type        = string
+
+  validation {
+    condition     = length(var.hydrator_image_tag) > 0 && var.hydrator_image_tag != "latest"
+    error_message = "hydrator_image_tag must be an explicit immutable tag (e.g. a git SHA), not 'latest'."
+  }
+}
+
+variable "hydrator_cpu" {
+  description = "Fargate CPU units for a hydrator run (256 = 0.25 vCPU)."
+  type        = number
+  default     = 256
+}
+
+variable "hydrator_memory" {
+  description = "Fargate memory (MiB) for a hydrator run."
+  type        = number
+  default     = 512
+}
+
+variable "hydrator_schedule_expression" {
+  description = "EventBridge Scheduler expression for hydration runs — cron() or rate(). Default: daily at 06:00 UTC."
+  type        = string
+  default     = "cron(0 6 * * ? *)"
+}
+
+variable "hydrator_schedule_enabled" {
+  description = "Master switch for the schedule. Disable to pause hydration without destroying anything."
+  type        = bool
+  default     = true
+}
+
+# ---------------------------------------------------------------------------
+# Data stores (RDS Postgres + ElastiCache Valkey — the hydrator writes them,
+# the api reads them)
+# ---------------------------------------------------------------------------
+
+variable "db_engine_version" {
+  description = "Postgres engine version (major-only, e.g. \"18\", tracks the latest minor). Keep the major in step with code/compose.yaml."
+  type        = string
+  default     = "18.4"
+}
+
+variable "db_instance_class" {
+  description = "RDS instance class."
+  type        = string
+  default     = "db.t4g.micro"
+}
+
+variable "db_allocated_storage" {
+  description = "Initial RDS storage (GiB); storage autoscaling grows it up to db_max_allocated_storage."
+  type        = number
+  default     = 20
+}
+
+variable "db_max_allocated_storage" {
+  description = "Storage autoscaling ceiling (GiB)."
+  type        = number
+  default     = 100
+}
+
+variable "db_multi_az" {
+  description = "Standby replica in a second AZ with automatic failover. On by default; set false to halve RDS cost in throwaway dev stacks."
+  type        = bool
+  default     = true
+}
+
+variable "valkey_engine_version" {
+  description = "Valkey engine version on ElastiCache; keep the major in step with code/compose.yaml."
+  type        = string
+  default     = "9.1"
+}
+
+variable "valkey_node_type" {
+  description = "ElastiCache node type."
+  type        = string
+  default     = "cache.t4g.micro"
+}
+
+variable "valkey_num_cache_clusters" {
+  description = "Nodes in the replication group. >1 enables multi-AZ automatic failover (default 2 — primary + one replica); set 1 to save cost in throwaway dev stacks."
+  type        = number
+  default     = 2
+}
+
+# ---------------------------------------------------------------------------
 # Load balancer / TLS
 # ---------------------------------------------------------------------------
 

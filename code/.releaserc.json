@@ -1,0 +1,15 @@
+{
+  "branches": ["main"],
+  "tagFormat": "v${version}",
+  "plugins": [
+    "@semantic-release/commit-analyzer",
+    "@semantic-release/release-notes-generator",
+    [
+      "@semantic-release/exec",
+      {
+        "publishCmd": "./scripts/release-images.sh ${nextRelease.version}"
+      }
+    ],
+    "@semantic-release/github"
+  ]
+}

@@ -1,0 +1,50 @@
+# Local development dependencies — Postgres and Valkey standing in for RDS and
+# ElastiCache. Only the datastores run in Docker; the services themselves run
+# on the host with hot reload (npm run dev -w <service>).
+#
+#   docker compose up -d --wait    # start (from code/)
+#   docker compose down            # stop (keeps Postgres data)
+#   docker compose down -v         # stop + reset Postgres data
+#
+# Credentials below are throwaway local-dev values and match the defaults in
+# the services' .env.example files — never put real credentials here.
+
+name: express-fargate-dev
+
+services:
+  postgres:
+    # Match the major version you'll run on RDS (infrastructure/variables.tf).
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: app
+    # Bind to loopback only — don't expose a passworded dev DB to the LAN.
+    ports:
+      - '127.0.0.1:5432:5432'
+    volumes:
+      # postgres:18+ images moved the data dir — mount /var/lib/postgresql
+      # (not .../data). A volume created by an older major won't start here:
+      # `docker compose down -v` and rehydrate.
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres -d app']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  valkey:
+    # Match the major version you'll run on ElastiCache.
+    image: valkey/valkey:9-alpine
+    ports:
+      - '127.0.0.1:6379:6379'
+    healthcheck:
+      test: ['CMD', 'valkey-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    # Deliberately no volume: it's a cache. Losing it is the normal case the
+    # system already handles (hydration rebuilds it; keys carry TTLs anyway).
+
+volumes:
+  postgres-data:

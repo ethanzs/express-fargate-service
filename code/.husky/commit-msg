@@ -1,0 +1,1 @@
+code/node_modules/.bin/commitlint --config code/commitlint.config.mjs --edit "$1"

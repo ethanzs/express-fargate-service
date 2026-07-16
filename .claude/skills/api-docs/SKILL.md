@@ -16,15 +16,15 @@ TechDocs-ready (rendered via MkDocs).
 
 ## Source of truth (read these)
 
-- `code/src/app.ts` — which routers are mounted where, and which are public vs
+- `code/api/src/app.ts` — which routers are mounted where, and which are public vs
   behind `requireAuth` (everything under `/api` is protected; `/healthz` is public).
-- `code/src/routes/*.ts` — methods, paths, success status codes, response bodies.
+- `code/api/src/routes/*.ts` — methods, paths, success status codes, response bodies.
 - The zod schemas used by `validate({ body, params, query })` — translate their
   constraints (`min`/`max`/`trim`/`coerce`/`int`/`positive`) into the field tables.
-- `code/src/middleware/auth.ts` — bearer JWT scheme and 401 messages.
-- `code/src/middleware/errorHandler.ts` — shared error shapes (ZodError → 400 with
+- `code/api/src/middleware/auth.ts` — bearer JWT scheme and 401 messages.
+- `code/api/src/middleware/errorHandler.ts` — shared error shapes (ZodError → 400 with
   `details`, `HttpError`, 404, body-parser 413/400, 500 hidden in prod).
-- `code/src/config.ts` — base path, `JSON_BODY_LIMIT`, correlation-id header.
+- `code/api/src/config.ts` — base path, `JSON_BODY_LIMIT`, correlation-id header.
 
 ## Steps
 

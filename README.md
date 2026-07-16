@@ -1,277 +1,276 @@
-# express-fargate-service
+# express-fargate-services
 
-A small, production-minded Express.js (v5) JSON API in TypeScript, built to be
-containerized and deployed to **ECR / ECS Fargate**. KISS by design — minimal
-dependencies, one clear pattern per concern.
+Two small, production-minded TypeScript services, containerized and deployed
+to **ECR / ECS Fargate**. KISS by design — minimal dependencies, one clear
+pattern per concern.
+
+The flow: the **hydrator** runs on a schedule (EventBridge → one-off Fargate
+task), migrates the Postgres schema, ingests reference data, and
+write-throughs it into RDS Postgres and ElastiCache Valkey. The **api** (an
+Express 5 app behind an ALB, authenticated with Microsoft Entra ID) serves
+that data cache-first, falling back to Postgres and re-populating expired
+keys. A small internal package, **`@app/shared`**, holds the contracts both
+sides must agree on.
+
+## Table of contents
+
+- [Repository layout](#repository-layout)
+- [Highlights](#highlights)
+- [Local development](#local-development)
+  - [Prerequisites](#prerequisites)
+  - [First-time setup](#first-time-setup)
+  - [Day-to-day commands](#day-to-day-commands)
+  - [The datastores](#the-datastores)
+  - [Troubleshooting](#troubleshooting)
+- [Workspace scripts](#workspace-scripts)
+- [Docker](#docker)
+- [Releases & versioning](#releases--versioning)
+- [Deploying to AWS](#deploying-to-aws)
+
+Per-project detail lives in each project's README:
+[api](code/api/README.md) · [hydrator](code/hydrator/README.md) ·
+[shared](code/shared/README.md) · [infrastructure](infrastructure/README.md) ·
+[API endpoint reference](docs/api.md)
 
 ## Repository layout
 
 ```
 .                     # shared docs live at the root (README, CLAUDE, ROADMAP)
-├── code/             # the Express app (run npm commands from here)
-└── infrastructure/   # Terraform for the AWS deployment (see its own README)
+├── code/             # npm workspace (run npm commands from here)
+│   ├── api/          # Express 5 JSON API — auth, validation, cache-aside reads
+│   ├── hydrator/     # scheduled run-to-completion job — migrations + hydration
+│   └── shared/       # @app/shared — schemas/types/helpers both services use
+└── infrastructure/   # Terraform for the AWS deployment
 ```
 
-Run app commands from `code/` (e.g. `cd code && npm run dev`); run Terraform from
+Each part has its own README with the full detail:
+
+- [`code/api/README.md`](code/api/README.md) — endpoints, Entra ID auth,
+  validation & errors, data access, observability, env vars
+- [`code/hydrator/README.md`](code/hydrator/README.md) — run lifecycle,
+  drizzle schema & migrations, metrics, env vars
+- [`code/shared/README.md`](code/shared/README.md) — what belongs in the
+  shared package and how it's consumed
+- [`infrastructure/README.md`](infrastructure/README.md) — the AWS stack
+  (ECR, ALB, ECS, EventBridge schedule, alarms) and deploy flow
+- [`docs/api.md`](docs/api.md) — generated endpoint reference
+
+Run app commands from the workspace root `code/` (e.g. `cd code && npm run build`)
+or target one package with `-w` (e.g. `npm run dev -w api`); run Terraform from
 `infrastructure/`.
 
-## What's inside
+## Highlights
 
-- **Express 5** — native async error forwarding (route handlers can just `throw`).
-- **zod input validation** — schema-validated body/params/query; failures return a 400 with field detail. Request bodies are size-capped.
-- **Entra ID (Azure AD) JWT auth** — `/api/*` requires a valid MSAL access token, verified against Microsoft's JWKS with `jose`.
-- **helmet + CORS** — sensible security headers; allowlisted cross-origin access for the SPA.
-- **ALB-safe timeouts** — keep-alive tuned above the load balancer's idle timeout to avoid 502s.
-- **pino / pino-http** — structured JSON logs that drop straight into CloudWatch.
-- **Graceful shutdown** — handles `SIGTERM` from ECS so deploys drain cleanly.
-- **Multi-stage Docker build** — small runtime image, runs as non-root `node`.
-- **ESLint + Prettier + Vitest** — lint, format, and an example test suite.
-
-## Project layout
-
-```
-code/
-  src/
-  app.ts                 # buildApp() — no listen(), so it's testable
-  server.ts              # entrypoint: listen + graceful shutdown
-  config.ts              # env-driven config (12-factor)
-  logger.ts              # pino logger
-  middleware/
-    auth.ts              # requireAuth — Entra ID JWT validation
-    validate.ts          # validate({ body, params, query }) — zod
-    errorHandler.ts      # HttpError, ZodError→400, 404, central handler
-  routes/
-    health.ts            # GET /healthz (public)
-    me.ts                # GET /api/me (returns the caller's claims)
-    items.ts             # example REST resource (in-memory)
-test/
-  app.test.ts            # supertest integration tests
-```
-
-## Authentication (Microsoft Entra ID / MSAL)
-
-The frontend signs users in with MSAL and calls this API with the resulting
-**access token** in `Authorization: Bearer <token>`. Every `/api/*` route runs
-`requireAuth`, which verifies the token's signature (via the tenant JWKS),
-issuer, audience, and expiry before the handler runs. `/healthz` stays public.
-
-### One-time Entra ID setup
-
-1. **Register the API** — create an App Registration for this service. Note the
-   **Directory (tenant) ID** and **Application (client) ID**.
-2. **Expose an API** — under _Expose an API_, set the Application ID URI
-   (e.g. `api://<client-id>`) and add a scope (e.g. `access_as_user`).
-3. **Frontend app** — its MSAL config requests that scope; the access token it
-   receives is what this API validates.
-
-### Configure the service
-
-Set these (locally in `.env`, on Fargate in the task definition / Secrets):
-
-| Variable             | Required | Notes                                                  |
-| -------------------- | -------- | ------------------------------------------------------ |
-| `AZURE_TENANT_ID`    | yes      | Directory (tenant) ID                                  |
-| `AZURE_CLIENT_ID`    | yes      | This API's Application (client) ID                     |
-| `AZURE_AD_AUDIENCE`  | yes      | Expected `aud` — client id or `api://<client-id>`      |
-| `AZURE_AD_INSTANCE`  | no       | Override for sovereign clouds                          |
-| `AZURE_AD_ISSUER`    | no       | Override (see token-version note below)                |
-| `AZURE_AD_JWKS_URI`  | no       | Override; defaults to the tenant v2.0 keys endpoint    |
-
-The server **fails fast on boot in production** if the three required values are
-missing; in dev it logs a warning and protected routes return 401.
-
-> **Token version gotcha:** the defaults assume **v2.0** access tokens. If your
-> app registration still issues v1.0 tokens (`accessTokenAcceptedVersion` is not
-> `2` in the manifest), the issuer is `https://sts.windows.net/<tenant-id>/` —
-> set `AZURE_AD_ISSUER` accordingly, or flip the manifest to v2.0.
-
-### Calling a protected route
-
-```bash
-curl localhost:3000/api/me -H "Authorization: Bearer <access-token>"
-```
-
-`req.auth` holds the verified claims (`oid`, `name`, `roles`, …). The `roles`
-claim is already captured for the planned admin/role-based access — enforcement
-will layer on top of `requireAuth` later.
-
-## Validation & errors
-
-Request input is validated with [zod](https://zod.dev) via the
-`validate({ body, params, query })` middleware (`src/middleware/validate.ts`).
-Schemas live next to their route and are the single source of truth for shape and
-validation; the sanitized body (trimmed/coerced) is written back to `req.body`.
-
-A failed validation returns **400** with field-level detail:
-
-```http
-POST /api/items   { }
-→ 400
-{ "error": "Validation failed", "details": [{ "path": "name", "message": "..." }] }
-```
-
-The central error handler (`src/middleware/errorHandler.ts`) also reads
-`status`/`statusCode` off library errors, so a malformed JSON body returns 400 and
-an oversized body (over `JSON_BODY_LIMIT`, default `100kb`) returns 413 — not a 500.
-
-> Express 5 note: `req.query` is a **read-only getter**, so the middleware
-> validates query params in place rather than reassigning them.
+- **Express 5 + strict TypeScript + zod** — async error forwarding, validated
+  input, no `any`.
+- **Entra ID (Azure AD) JWT auth** on `/api/*`, verified against the tenant
+  JWKS.
+- **Postgres (drizzle ORM + generated migrations) with a Valkey cache-aside** —
+  the hydrator bulk-writes both stores; the api reads cache-first and
+  re-populates expired keys.
+- **CloudWatch-native observability** — structured pino logs with secret
+  redaction, plus real metrics via EMF (no extra IAM).
+- **Cost-aware deployment** — the api autoscales behind an ALB; the hydrator
+  only exists while a scheduled run is executing.
+- **Workspace-scoped Docker images** — each multi-stage build ships only that
+  service's dependency closure, as non-root `node`.
+- **Tests without infrastructure** — Vitest + supertest + in-memory Postgres
+  (PGlite) running the real migrations and SQL.
 
 ## Local development
 
+The model: **only the datastores run in Docker** (Postgres 18 + Valkey 9 via
+`code/compose.yaml`, standing in for RDS / ElastiCache); the services run on
+the host with hot reload. Compose is **local development only** — production
+images know nothing about it: locally the services read
+`DATABASE_URL`/`VALKEY_URL` pointing at compose; on AWS, Terraform injects the
+datastore config and Postgres auth is **IAM** (short-lived tokens via each
+task role — no database password exists in any task).
+
+### Prerequisites
+
+- **Node.js ≥ 22** and npm ≥ 10 (workspaces + `--env-file` support)
+- **Docker** with Compose v2 (`docker compose version`)
+
+### First-time setup
+
+All commands run from `code/` (the npm workspace root):
+
 ```bash
 cd code
+
+# 1. Install all workspaces (one root lockfile, hoisted node_modules)
 npm install
-cp .env.example .env
-npm run dev          # hot-reload via tsx
+
+# 2. Build the shared package — api and hydrator resolve @app/shared from its dist/
+npm run build -w shared
+
+# 3. Start the local datastores and wait for their healthchecks
+docker compose up -d --wait
+
+# 4. Create per-service env files — the defaults already point at the compose
+#    stack (same throwaway credentials), so the copies work unedited
+cp api/.env.example api/.env
+cp hydrator/.env.example hydrator/.env
+
+# 5. Create the schema and seed the stores (migrates, upserts rows, warms Valkey)
+npm run dev -w hydrator
+
+# 6. Run the api with hot reload → http://localhost:3000
+npm run dev -w api
 ```
 
-Then:
+Smoke-test from another terminal:
 
 ```bash
-curl localhost:3000/healthz
-curl localhost:3000/api/items
-curl -X POST localhost:3000/api/items -H 'content-type: application/json' -d '{"name":"hello"}'
+curl localhost:3000/healthz          # 200 — public, no auth
+curl localhost:3000/api/items        # 401 — protected; needs an Entra ID token
+docker compose exec postgres psql -U postgres -d app -c 'TABLE items'
+docker compose exec valkey valkey-cli get items:1
 ```
 
-Full endpoint reference: [`docs/api.md`](docs/api.md) (generated from the routes
-and zod schemas by the `/api-docs` skill).
+> **Auth in dev:** the Entra ID vars in `api/.env` are placeholders. Without
+> real values the server boots with a warning and every `/api/*` route returns
+> 401 — `/healthz` and the error paths still work, which is what the test
+> suite covers. To exercise protected routes locally, fill in a real tenant's
+> `AZURE_*` values and call with a bearer token from that tenant (see the
+> [api README](code/api/README.md)).
 
-## Scripts
+### Day-to-day commands
 
-| Command              | Purpose                                  |
-| -------------------- | ---------------------------------------- |
-| `npm run dev`        | Hot-reloading dev server                 |
-| `npm run build`      | Compile TypeScript to `dist/`            |
-| `npm start`          | Run the compiled server                  |
-| `npm test`           | Run the test suite (Vitest + supertest)  |
-| `npm run lint`       | ESLint                                   |
-| `npm run format`     | Prettier write                           |
-| `npm run typecheck`  | Type-check without emitting              |
+| Command                                           | What it does                                                 |
+| ------------------------------------------------- | ------------------------------------------------------------ |
+| `npm run dev -w api`                              | api with hot reload (`tsx`, loads `api/.env`)                |
+| `npm run dev -w hydrator`                         | one full hydration run: migrate → upsert → warm cache → exit |
+| `npm run db:migrate -w hydrator`                  | apply pending drizzle migrations only (no hydration)         |
+| `npm run db:generate -w hydrator`                 | generate a SQL migration after a schema change in `shared`   |
+| `npm test` / `npm run lint` / `npm run typecheck` | the full gate, across all workspaces                         |
+| `docker compose up -d --wait` / `down`            | start / stop the datastores (`down` keeps Postgres data)     |
+| `docker compose down -v`                          | stop **and reset** Postgres data                             |
 
-## Logging & redaction
+Two things worth internalizing:
 
-Logs are structured JSON via [pino](https://getpino.io) (`src/logger.ts`) and
-HTTP request logging via `pino-http`, tuned for AWS CloudWatch:
+- **After editing `code/shared`, run `npm run build -w shared`.** The services
+  (and their tests) resolve `@app/shared` from its compiled `dist/` — stale
+  builds show up as type errors or old behavior. The root `build`/`test`/
+  `typecheck` scripts do this automatically; the per-service `dev` servers
+  don't.
+- **Tests never need Docker.** The hydrator's tests run the real migrations
+  and SQL against in-memory Postgres (PGlite); the api's tests use supertest
+  with no network. `npm test` works on a fresh clone with no compose stack.
 
-- **Stable dimensions** — every line carries `service` and `env`, so you can
-  filter/group cleanly in Logs Insights and dashboard widgets. `service`
-  defaults to `express-fargate-service` and is overridable via `SERVICE_NAME`.
-- **Readable levels** — emitted as labels (`"level":"info"`) rather than pino's
-  numeric codes, so queries read `level="error"` not `level=50`.
-- **ISO timestamps** — `"time":"2026-06-30T..."` instead of epoch millis.
-- **Health-check noise dropped** — `GET /healthz` is excluded from request
-  logging (the ALB polls it constantly; logging it would dominate volume/cost
-  and skew request-count metrics).
-- **Pretty in dev only** — production emits raw JSON straight to stdout (which
-  the ECS `awslogs` driver ships to CloudWatch); local dev pipes through
-  `pino-pretty` for readability.
+### The datastores
 
-### CloudWatch metrics (EMF)
+`code/compose.yaml` pins `postgres:18-alpine` and `valkey/valkey:9-alpine`
+(match the majors you'll run in AWS), adds healthchecks (`--wait` blocks until
+ready), and binds both ports to `127.0.0.1` only — nothing is exposed to the
+LAN. Credentials are throwaway local-dev values (`postgres`/`postgres`, db
+`app`) and must never be real ones.
 
-Beyond queryable logs, the app emits true CloudWatch **Metrics** via the
-[Embedded Metric Format](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/CloudWatch_Embedded_Metric_Format.html)
-(`src/middleware/metrics.ts`). One EMF line is written per completed request
-(health checks excluded); CloudWatch auto-extracts the metrics from the log
-stream — **no `PutMetricData`, no extra IAM**, it rides the existing awslogs
-pipeline.
+- **Postgres** persists in the `postgres-data` named volume across
+  `up`/`down`; `docker compose down -v` deletes it for a clean slate (rerun
+  the hydrator to rebuild).
+- **Valkey** is deliberately ephemeral — it's a cache. Losing it is the normal
+  case the system already handles: hydration rebuilds it, and every key
+  carries a TTL.
 
-Namespace `ExpressFargateService`, dimensioned by `service` / `env` and
-additionally `route` / `statusClass`:
+To change the database schema, see the
+[hydrator README](code/hydrator/README.md#schema--migrations-drizzle).
 
-| Metric | Unit | Use |
-| ------ | ---- | --- |
-| `RequestCount` | Count | throughput, request rate |
-| `RequestLatency` | Milliseconds | p50/p90/p99 latency (CloudWatch computes percentiles) |
-| `HttpServerErrorCount` | Count | 5xx rate, error alarms |
+### Troubleshooting
 
-> **Cardinality matters.** Dimensions use the matched **route template**
-> (`GET /api/items/:id`) and a coarse **status class** (`2xx`/`4xx`/`5xx`) — never
-> the raw URL, an id, or a user — so the number of metric streams stays bounded.
-> When adding business metrics later (e.g. admin actions for RBAC), keep
-> dimensions low-cardinality the same way.
+- **`Bind for 127.0.0.1:5432 failed: port is already allocated`** — another
+  local Postgres (or project stack) owns the port. Find it with `docker ps`
+  (or `lsof -i :5432`) and stop it; the compose file intentionally keeps the
+  standard ports.
+- **`Cannot find module '@app/shared'` / stale shared types** — run
+  `npm run build -w shared` (fresh clones haven't built it yet).
+- **`ENOENT: .env`** on `npm run dev` — copy the example first
+  (`cp <svc>/.env.example <svc>/.env`); `tsx --env-file` requires the file to
+  exist.
+- **Hydrator exits 1 with `connection refused`** — the compose stack isn't up
+  (or ports are shadowed by another stack): `docker compose up -d --wait`.
+- **Weird DB state after schema experiments** — `docker compose down -v`,
+  then `npm run dev -w hydrator` to migrate + reseed from scratch.
 
-### Redaction of sensitive data
+## Workspace scripts
 
-A pino `redact` config scrubs secrets from every log line (in both dev and
-prod) before it's written, replacing them with `[REDACTED]`. The primary risk
-is that `pino-http` logs request headers — which include the bearer token. The
-redacted paths (see `redactPaths` in `src/logger.ts`):
+From `code/` — each runs across the right workspaces in the right order
+(`shared` is always built first):
 
-| Path | Why |
-| ---- | --- |
-| `req.headers.authorization` | the Entra ID bearer (access) token |
-| `req.headers.cookie` / `res.headers["set-cookie"]` | session cookies |
-| `req.headers["x-api-key"]` | API keys |
-| `password`, `token`, `accessToken`, `refreshToken`, `clientSecret`, `authorization` (top level and one level deep) | common secret-bearing fields |
+| Command             | Purpose                                      |
+| ------------------- | -------------------------------------------- |
+| `npm run build`     | Build `shared`, then compile both services   |
+| `npm test`          | Build `shared`, then Vitest in every package |
+| `npm run lint`      | ESLint in every package                      |
+| `npm run format`    | Prettier write in every package              |
+| `npm run typecheck` | Build `shared`, then type-check the services |
 
-To scrub a new sensitive field, add its path to `redactPaths` in
-`src/logger.ts`. Note: pino's redaction matches the top level and **one** level
-deep (e.g. `body.password`), not arbitrarily nested paths — this app doesn't log
-request bodies by default, so header redaction is the part that matters in
-practice.
-
-### Request identity & auditing
-
-For debugging and auditing without leaking PII:
-
-- After auth, `requireAuth` attaches the **pseudonymous** actor to the request
-  logger (`userId` = Entra `oid`, `tenantId` = `tid`), so every log line for an
-  authenticated request says who it belongs to. Name/email are deliberately
-  **not** logged — the immutable `oid` is the stable key, and keeping PII out of
-  logs avoids retention/erasure (GDPR) headaches.
-- Each request gets a **correlation id** (`reqId`) from the ALB's
-  `X-Amzn-Trace-Id` header (or `X-Request-Id`), so a request can be followed
-  across services. A Logs Insights query like `filter userId = "<oid>"` returns
-  a user's full footprint, stitched by `reqId`.
-- **Audit events** (security-relevant actions) go through `recordAudit()` in
-  `src/audit.ts` — a separate stream tagged `log_type:"audit"`, pinned to `info`
-  so it's never suppressed by `LOG_LEVEL`. Route those to their own log
-  group/retention via a CloudWatch subscription filter. This is the seam for the
-  planned admin/RBAC features.
+Target a single package with `-w`: `npm run dev -w api`, `npm run build -w
+shared`. Each service also keeps its own `dev`/`start`/`test` scripts.
 
 ## Docker
 
-The build context is `code/` (run from the repo root):
+Each service has its own Dockerfile, but the build context is always the
+workspace root `code/` so the `shared` package is in context (run from the
+repo root):
 
 ```bash
-docker build -t express-fargate-service code/
-docker run --rm -p 3000:3000 \
-  -e AZURE_TENANT_ID=... -e AZURE_CLIENT_ID=... -e AZURE_AD_AUDIENCE=... \
-  express-fargate-service
+docker build -f code/api/Dockerfile -t express-fargate-service code/
+docker build -f code/hydrator/Dockerfile -t hydrator-service code/
 ```
 
-## Deploying to ECR / ECS Fargate
+Each image compiles `shared` and the service inside the build and ships
+`shared/dist` alongside the service's `dist` — the internal package is baked
+in, nothing is pulled from a registry. Runtime dependencies are scoped per
+workspace (`npm ci --omit=dev -w <service>`), so each image carries only that
+service's dependency closure — the api ships no `pg` driver it doesn't use,
+the hydrator no `express`.
 
-The AWS stack (ECR, ALB, ECS Fargate service, autoscaling, alarms) is
-provisioned with **Terraform in [`infrastructure/`](infrastructure/)** using the
-`terraform-aws-modules`. It deploys into an **existing VPC/subnets** (referenced
-by id). See [`infrastructure/README.md`](infrastructure/README.md) for the full
-flow; in short:
+## Releases & versioning
 
-```bash
-cd infrastructure
-cp terraform.tfvars.example terraform.tfvars   # set vpc_id, subnets, azure_*, image_tag
-terraform init && terraform apply
+Versioning is **lockstep**: one semver for the whole repo, computed by
+[semantic-release](https://semantic-release.gitbook.io) from
+[Conventional Commits](https://www.conventionalcommits.org) and applied to
+every artifact. On each push to `main` (after the CI gate passes), a
+release-worthy commit produces:
 
-# build & push the image with the immutable tag you set (context is ../code)
-ECR_URL=$(terraform output -raw ecr_repository_url)
-docker build --platform linux/amd64 -t "$ECR_URL:$TAG" ../code
-docker push "$ECR_URL:$TAG"
-```
+- a git tag `vX.Y.Z` + GitHub release notes,
+- both Docker images, built and pushed to ECR as `vX.Y.Z` (immutable), with
+  the version baked in as `SERVICE_VERSION` — so every log line says which
+  release wrote it.
 
-The Terraform sets the container `environment` (`NODE_ENV`, `PORT`, `LOG_LEVEL`,
-`CORS_ORIGINS`, `AZURE_*`), wires the ALB health check to `/healthz`, and keeps
-the ALB idle timeout (60s) below the app's keep-alive (65s) to avoid 502s. ECS
-sends `SIGTERM` on deploy/scale-in and the app drains in-flight requests (up to
-`SHUTDOWN_TIMEOUT_MS`) before exiting.
+Commit messages drive the bump: `fix:` → patch, `feat:` → minor,
+`feat!:`/`BREAKING CHANGE:` → major; `docs:`/`chore:`/`refactor:` → **no
+release, no images**. Suggested scopes: `api`, `hydrator`, `shared`, `infra`.
+A husky `commit-msg` hook (installed by `npm install`) and a CI job lint the
+messages.
 
-> For real secrets (not the Azure identifiers, which are public), use Secrets
-> Manager / SSM via the task definition's `secrets` field — never bake them in.
+Because versions are lockstep, api `v1.4.0` and hydrator `v1.4.0` were built
+from the same commit — the deploy rule for schema changes is simply "run the
+hydrator at ≥ the api's version". A hydrator-only fix still bumps the api
+image; that's intentional (fleet versions stay comparable), and images for
+unchanged services are byte-for-byte rebuilds.
 
-## Adding a database later
+Pieces: `code/.releaserc.json` (config), `code/scripts/release-images.sh`
+(image fan-out), `code/commitlint.config.mjs` (message rules),
+`.github/workflows/ci.yml` (gate + release; see its header for the four
+repository variables that enable ECR pushes — until they're set, releases
+tag + publish notes and skip images).
 
-Replace the in-memory store in `code/src/routes/items.ts` with a repository
-module and add the client (e.g. `pg`/Prisma) to `dependencies`. Keep the
-`/healthz` endpoint dependency-free so a slow DB doesn't cause health-check
-restart loops; add a separate `/readyz` if you need readiness gating.
+## Deploying to AWS
+
+The stack (two ECR repos, ALB, ECS Fargate cluster, the api service with
+autoscaling, the hydrator's EventBridge schedule, **RDS Postgres +
+ElastiCache Valkey** with IAM database auth and locked-down security groups,
+CloudWatch alarms) is provisioned with **Terraform in
+[`infrastructure/`](infrastructure/)**, deploying into an existing VPC. After
+the first apply, run the one-time `infrastructure/db-bootstrap.sql` via psql
+(as the master user) to create the per-service IAM database users (see the
+infrastructure README).
+
+See [`infrastructure/README.md`](infrastructure/README.md) for the full flow:
+`terraform apply`, then set `image_tag`/`hydrator_image_tag` to a release
+version (e.g. `v1.4.0` — CI already pushed those images) and apply again.
+
+The production-readiness backlog lives in [`ROADMAP.md`](ROADMAP.md).

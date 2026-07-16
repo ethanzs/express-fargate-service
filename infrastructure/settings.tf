@@ -3,9 +3,9 @@
 # ==============================================================================
 
 terraform {
-  # 1.10+ enables native S3 state locking (use_lockfile), so no DynamoDB table
-  # is needed for the backend.
-  required_version = ">= 1.10"
+  # 1.11+ for write-only arguments (the RDS master password never touches
+  # state); 1.10+ already gave native S3 state locking (use_lockfile).
+  required_version = ">= 1.11.1"
 
   required_providers {
     aws = {
