@@ -29,8 +29,6 @@
     "semantic-release": "^25.0.7"
   },
   "overrides": {
-    "@esbuild-kit/core-utils": {
-      "esbuild": "^0.25.0"
-    }
+    "esbuild": "^0.28.0"
   }
 }
